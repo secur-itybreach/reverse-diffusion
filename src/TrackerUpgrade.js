@@ -56,47 +56,101 @@ export class TrackerUpgrade {
     return Math.sqrt((a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2);
   }
 
-  _sampleAvgColor(p, x, y, w, h) {
-    const pw = p.width;
-    const ph = p.height;
-    const d = p.pixels;
-    const density = p.pixelDensity();
+  _sampleDominantColors(p, x, y, w, h, count = 3) {
+  const pw = p.width;
+  const ph = p.height;
+  const d = p.pixels;
+  const density = p.pixelDensity();
+  // ignore the outer border so the drawn bbox stroke isn't sampled
+  const inset = 5;
 
-    const x0 = Math.max(0, Math.floor(x));
-    const y0 = Math.max(0, Math.floor(y));
-    const x1 = Math.min(pw, Math.floor(x + w));
-    const y1 = Math.min(ph, Math.floor(y + h));
+  const x0 = Math.max(0, Math.floor(x + inset));
+  const y0 = Math.max(0, Math.floor(y + inset));
+  const x1 = Math.min(pw, Math.floor(x + w - inset));
+  const y1 = Math.min(ph, Math.floor(y + h - inset));
 
-    let rSum = 0, gSum = 0, bSum = 0, wSum = 0;
+  
+  // quantized color buckets
+  const buckets = new Map();
 
-    for (let py = y0; py < y1; py++) {
-      for (let px = x0; px < x1; px++) {
-        const i = 4 * ((py * density) * (pw * density) + (px * density));
-        const r = d[i], g = d[i + 1], b = d[i + 2];
+  // step a bit for performance
+  const step = 2;
+  const quant = 24; // lower = more grouping
 
-        const max = Math.max(r, g, b);
-        const min = Math.min(r, g, b);
-        const sat = max - min;
+  for (let py = y0; py < y1; py += step) {
+    for (let px = x0; px < x1; px += step) {
+      const i = 4 * ((py * density) * (pw * density) + (px * density));
+      const r = d[i];
+      const g = d[i + 1];
+      const b = d[i + 2];
 
-        if (max < 30 || sat < 20) continue;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const sat = max - min;
+      const brightness = (r + g + b) / 3;
 
-        const weight = sat * sat;
+      // ignore near-black, near-white, and near-gray pixels
+      if (brightness < 25 || brightness > 245 || sat < 18) continue;
 
-        rSum += r * weight;
-        gSum += g * weight;
-        bSum += b * weight;
-        wSum += weight;
+      const qr = Math.round(r / quant) * quant;
+      const qg = Math.round(g / quant) * quant;
+      const qb = Math.round(b / quant) * quant;
+
+      const key = `${qr},${qg},${qb}`;
+      const weight = sat + 1; // saturated colors count more
+
+      if (!buckets.has(key)) {
+        buckets.set(key, {
+          rSum: 0,
+          gSum: 0,
+          bSum: 0,
+          weightSum: 0,
+          count: 0,
+        });
       }
+
+      const bucket = buckets.get(key);
+      bucket.rSum += r * weight;
+      bucket.gSum += g * weight;
+      bucket.bSum += b * weight;
+      bucket.weightSum += weight;
+      bucket.count += 1;
     }
-
-    if (wSum === 0) return { r: 200, g: 200, b: 200 };
-
-    return {
-      r: Math.round(rSum / wSum),
-      g: Math.round(gSum / wSum),
-      b: Math.round(bSum / wSum),
-    };
   }
+
+  if (buckets.size === 0) {
+    return [
+      { r: 200, g: 200, b: 200 },
+      { r: 160, g: 160, b: 160 },
+      { r: 120, g: 120, b: 120 },
+    ];
+  }
+
+  let colors = Array.from(buckets.values())
+    .map((bucket) => ({
+      r: Math.round(bucket.rSum / bucket.weightSum),
+      g: Math.round(bucket.gSum / bucket.weightSum),
+      b: Math.round(bucket.bSum / bucket.weightSum),
+      score: bucket.count * 0.7 + bucket.weightSum * 0.3,
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  // merge near-duplicate colors
+  const merged = [];
+  const minDist = 35;
+
+  for (const color of colors) {
+    const tooClose = merged.some((c) => this._colorDist(c, color) < minDist);
+    if (!tooClose) merged.push(color);
+    if (merged.length >= count) break;
+  }
+
+  while (merged.length < count) {
+    merged.push(merged[merged.length - 1] || { r: 200, g: 200, b: 200 });
+  }
+
+  return merged.map(({ r, g, b }) => ({ r, g, b }));
+}
 
   /**
    * Returns the average perceived brightness (0–255) of all pixels in the box,
@@ -268,6 +322,7 @@ export class TrackerUpgrade {
             x: track.lockedBox.x + track.lockedBox.width / 2,
             y: track.lockedBox.y + track.lockedBox.height / 2,
             avgColor: track.avgColor ?? null,
+palette: track.palette ?? null,
           });
         }
       }
@@ -285,9 +340,11 @@ export class TrackerUpgrade {
       const detCX = det.x + det.width / 2;
       const detCY = det.y + det.height / 2;
 
-      const detColor = p
-        ? this._sampleAvgColor(p, det.x, det.y, det.width, det.height)
-        : null;
+      const detPalette = p
+  ? this._sampleDominantColors(p, det.x, det.y, det.width, det.height, 3)
+  : null;
+
+const detColor = detPalette ? detPalette[0] : null; // keep first color for matching
 
       let bestTrack = null;
       let bestDist = Infinity;
@@ -320,6 +377,12 @@ export class TrackerUpgrade {
         bestTrack.cx = detCX;
         bestTrack.cy = detCY;
 
+        // keep palette fresh every frame so it's ready when heightTriggered fires
+        if (detPalette) {
+          bestTrack.palette  = detPalette;
+          bestTrack.avgColor = detPalette[0];
+        }
+
         bestTrack.smoothedHeight +=
           (det.height - bestTrack.smoothedHeight) * this.smoothingFactor;
 
@@ -334,7 +397,7 @@ export class TrackerUpgrade {
             id: bestTrack.id,
             x: bestTrack.cx,
             y: bestTrack.cy,
-            avgColor: bestTrack.avgColor ?? null,
+            palette: bestTrack.palette ?? null,
           });
         }
       } else {
@@ -363,6 +426,7 @@ export class TrackerUpgrade {
           missingFrames: 0,
           matched: true,
           avgColor: detColor,
+palette: detPalette,
         });
       }
     }
@@ -382,7 +446,8 @@ export class TrackerUpgrade {
   draw(p) {
     for (const track of this.tracks) {
       if (track.locked && track.lockedBox) {
-        p.stroke(255, 0, 0);
+        //p.stroke(255, 0, 0);
+        p.noStroke();
         p.strokeWeight(3);
         p.noFill();
         p.rect(
@@ -414,7 +479,8 @@ export class TrackerUpgrade {
         continue;
       }
 
-      p.stroke(0, 255, 0);
+      //p.stroke(0, 255, 0);
+      p.noStroke();
       p.strokeWeight(3);
       p.noFill();
       p.rect(track.x, track.y, track.width, track.height);
@@ -428,15 +494,18 @@ export class TrackerUpgrade {
       p.text(`diff: ${track.heightDiff.toFixed(1)}`, track.x + 8, track.y + 72);
       p.text(`stable: ${track.stableFrames}/${this.stabilityFrames}`, track.x + 8, track.y + 90);
 
-      if (track.avgColor) {
-        const { r, g, b } = track.avgColor;
-        p.fill(r, g, b);
-        p.noStroke();
-        p.rect(track.x + 8, track.y + 100, 18, 12);
+      if (track.palette?.length) {
+  p.noStroke();
 
-        p.fill(255);
-        p.text(`rgb(${r},${g},${b})`, track.x + 30, track.y + 111);
-      }
+  track.palette.forEach((c, idx) => {
+    p.fill(c.r, c.g, c.b);
+    p.rect(track.x + 8 + idx * 22, track.y + 100, 18, 12);
+  });
+
+  const c = track.palette[0];
+  p.fill(255);
+  p.text(`rgb(${c.r},${c.g},${c.b})`, track.x + 80, track.y + 111);
+}
     }
   }
 }

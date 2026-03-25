@@ -42,16 +42,16 @@ export class LSystem {
    * @param {object} p  - p5 instance (used only inside draw())
    * @param {number} x  - root x position
    * @param {number} y  - root y position
-   * @param {{ r, g, b }} [avgColor={ r:255, g:255, b:255 }] - branch color
-   */
-  constructor(p, x, y, avgColor = { r: 255, g: 255, b: 255 }) {
-    this._p    = p;
-    this._x    = x;
-    this._y    = y;
-    const { r = 255, g = 255, b = 255 } = avgColor;
-    this._r    = r;
-    this._g    = g;
-    this._b    = b;
+ * @param {Array<{ r, g, b }>} [palette=[...]] - branch colors (dominant, secondary, tertiary)
+ */
+constructor(p, x, y, palette = [{ r: 255, g: 255, b: 255 }, { r: 200, g: 200, b: 200 }, { r: 150, g: 150, b: 150 }]) {
+  this._p  = p;
+  this._x  = x;
+  this._y  = y;
+  const [c0 = { r: 255, g: 255, b: 255 }, c1 = { r: 200, g: 200, b: 200 }, c2 = { r: 150, g: 150, b: 150 }] = palette;
+  this._color0 = c0; // dominant
+  this._color1 = c1; // secondary
+  this._color2 = c2; // tertiary
 
     this._word          = LSystem.AXIOM;
     this._generation    = 0;
@@ -69,13 +69,19 @@ export class LSystem {
     const p   = this._p;
     const len = LSystem.LEN;
     const ang = LSystem.ANG;
-    const r   = this._r;
-    const g   = this._g;
-    const b   = this._b;
+    const r0   = this._color0.r;
+    const g0   = this._color0.g;
+    const b0   = this._color0.b;
+    const r1   = this._color1.r;
+    const g1   = this._color1.g;
+    const b1   = this._color1.b;
+    const r2   = this._color2.r;
+    const g2   = this._color2.g;
+    const b2   = this._color2.b;
 
     this._drawRules = {
       F: (t) => {
-        p.stroke(r, g, b);
+        p.stroke(r0, g0, b0);
         p.strokeWeight(10);
         p.line(0, 0, 0, -len * t);
         p.translate(0, -len * t);
@@ -86,12 +92,12 @@ export class LSystem {
       "]": ()  => { if (this._pushDepth > 0) { this._pushDepth--; p.pop(); } },
       A: (t) => {
         p.noStroke();
-        p.fill(r, g, b);
+        p.fill(r1, g1, b1);
         p.circle(0, 0, len * 5 * t);
       },
       B: (t) => {
         p.noStroke();
-        p.fill(r, g, b);
+        p.fill(r2, g2, b2);
         p.circle(0, 0, len * 5 * t);
       },
       X: () => { /* terminal — no drawing */ },

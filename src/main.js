@@ -22,10 +22,10 @@ const sketch = (p) => {
     smoothingFactor:  0.15,
     heightThreshold:  50,
     maxMissingFrames: 30,
-    onFractalTrigger({ id, x, y, avgColor }) {
+    onFractalTrigger({ id, x, y, palette }) {
       if (!trees.has(id)) {
-        trees.set(id, new LSystem(p, x, y,avgColor));
-        console.log(`Added tree with id ${id} at (${x}, ${y}), avgColor: ${avgColor.r}, ${avgColor.g}, ${avgColor.b}`); // debug log
+        trees.set(id, new LSystem(p, x, y,palette));
+        console.log(`Added tree with id ${id} at (${x}, ${y}), palette:`, palette);
       }
     },
   });
