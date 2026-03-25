@@ -1,0 +1,16 @@
+{
+  "name": "fractal-detector",
+  "version": "1.0.0",
+  "description": "Object detection with fractal tree growth using p5.js + ml5.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  },
+  "dependencies": {
+    "p5": "^1.9.4"
+  }
+}
