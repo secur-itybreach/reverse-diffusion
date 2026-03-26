@@ -2,6 +2,17 @@ import p5 from 'p5';
 import { LSystem } from './LSystem.js';
 import { TrackerUpgrade } from './TrackerUpgrade.js';
 
+let socket;
+
+function initSocket() {
+  socket = new WebSocket("ws://127.0.0.1:9980");
+
+  socket.onopen = () => console.log("WS connected");
+  socket.onclose = () => console.log("WS closed");
+  socket.onerror = (e) => console.error("WS error", e);
+}
+
+
 const sketch = (p) => {
   let video;
   let detector;
@@ -45,6 +56,8 @@ const sketch = (p) => {
     canvas.parent('app');
     p.background(0);
 
+    initSocket(); // WEB SOCKET TOUCHDESIGNER INIT
+
     video = p.createCapture(p.VIDEO, () => {
       videoReady = true;
       maybeStartDetection();
@@ -64,6 +77,14 @@ const sketch = (p) => {
   p.mousePressed = () => {
     const id = -(trees.size + 1); // negative ids avoid colliding with tracker ids
     trees.set(id, new LSystem(p, p.mouseX, p.mouseY));
+    console.log(`Manually added tree`); // debug log
+     // 🔥 envoi WebSocket
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({
+            type: "prompt",
+            prompt: p.random(["flower", "shadows", "oranges"])
+          }));
+        }
   };
 
   /** t: trigger the next locked tracked object. */
