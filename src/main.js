@@ -40,8 +40,8 @@ const sketch = (p) => {
 
   function onDetections(err, results) {
     if (err) { console.error(err); return; }
-    p.loadPixels();
-    tracker.update(results.filter(d => d.label !== 'person'), p);
+    video.loadPixels(); // sample from video, not the canvas
+    tracker.update(results.filter(d => d.label !== 'person'), video);
     detector.detect(video, onDetections);
   }
 
@@ -96,8 +96,9 @@ const sketch = (p) => {
   // ── Draw ──────────────────────────────────────────────────────────────────
 
   p.draw = () => {
-    p.image(video, 0, 0);
-    tracker.draw(p);
+    //p.image(video, 0, 0);
+    p.background(0);
+    //tracker.draw(p);
 
     for (const tree of trees.values()) {
       tree.update();

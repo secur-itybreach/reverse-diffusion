@@ -35,10 +35,9 @@ export class TrackerUpgrade {
 
   // ── Private ────────────────────────────────────────────────────────────────
 
-  _sampleDominantColors(p, x, y, w, h, count = 3) {
-    const pw = p.width, ph = p.height;
-    const d = p.pixels;
-    const density = p.pixelDensity();
+  _sampleDominantColors(video, x, y, w, h, count = 3) {
+    const pw = video.width, ph = video.height;
+    const d = video.pixels; // video pixels are always density 1
     const inset = 5; // skip the bbox border pixels
 
     const x0 = Math.max(0,  Math.floor(x + inset));
@@ -51,7 +50,7 @@ export class TrackerUpgrade {
 
     for (let py = y0; py < y1; py += step) {
       for (let px = x0; px < x1; px += step) {
-        const i = 4 * ((py * density) * (pw * density) + (px * density));
+        const i = 4 * (py * pw + px); // no pixelDensity for video
         const r = d[i], g = d[i + 1], b = d[i + 2];
 
         const sat = Math.max(r, g, b) - Math.min(r, g, b);
@@ -183,11 +182,11 @@ export class TrackerUpgrade {
 
   /**
    * Update tracks from the latest ml5 detections.
-   * Call p.loadPixels() before this for colour sampling.
+   * Pass the p5 video element for colour sampling (its pixels are independent of the canvas).
    * @param {Array}  detections - ml5 results (persons already filtered out)
-   * @param {object} [p]        - p5 instance
+   * @param {object} [video]    - p5 video element (call video.loadPixels() before this)
    */
-  update(detections, p = null) {
+  update(detections, video = null) {
     if (this.locked) return; // frozen until reset() is called
     for (const track of this.tracks) track.missingFrames++;
 
@@ -214,7 +213,7 @@ export class TrackerUpgrade {
         this._updateStability(bestTrack, detCX, detCY, det);
 
         // sample palette only while still unlocked — frozen at lock time
-        if (p && !bestTrack.locked) bestTrack.palette = this._sampleDominantColors(p, det.x, det.y, det.width, det.height);
+        if (video && !bestTrack.locked) bestTrack.palette = this._sampleDominantColors(video, det.x, det.y, det.width, det.height);
       } else {
         this.tracks.push({
           id: this.nextTrackId++,
@@ -227,7 +226,7 @@ export class TrackerUpgrade {
           locked: false, lockedBox: null,
           triggered: false,
           missingFrames: 0,
-          palette: p ? this._sampleDominantColors(p, det.x, det.y, det.width, det.height) : null,
+          palette: video ? this._sampleDominantColors(video, det.x, det.y, det.width, det.height) : null,
         });
       }
     }
