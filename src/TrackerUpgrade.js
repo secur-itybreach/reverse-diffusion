@@ -1,511 +1,257 @@
 /**
- * Manages the list of active object tracks.
- * When an object's height changes beyond the threshold, fires onFractalTrigger
- * with { id, x, y } — the track id and the fractal root position.
- * Tracker has no knowledge of Branch or rendering.
+ * Tracks detected objects across frames.
+ * Once an object stays stable for enough frames it is locked (frozen bounding box + palette).
+ * Call triggerOnLocked() — e.g. on keypress — to fire onFractalTrigger for the next locked track.
  */
 export class TrackerUpgrade {
   /**
    * @param {object}   opts
-   * @param {number}   opts.matchDistance
-   * @param {number}   opts.smoothingFactor
-   * @param {number}   opts.heightThreshold
-   * @param {number}   opts.maxMissingFrames
-   * @param {number}   opts.colorThreshold
-   * @param {number}   opts.stabilityFrames             - Frames needed before locking a box
-   * @param {number}   opts.stabilityPositionThreshold  - Max center movement to count as stable
-   * @param {number}   opts.stabilitySizeThreshold      - Max width/height change to count as stable
-   * @param {number}   opts.crushBrightnessGain         - Brightness increase (0-255) the zone must gain vs lock baseline to fire onCrushed (default 30)
-   * @param {function} opts.onFractalTrigger
-   * @param {function} opts.onCrushed                   - Called with { id, label, lockedBox, baselineBrightness, currentBrightness }
+   * @param {number}   opts.matchDistance              - Max px between detections to count as same track
+   * @param {number}   opts.maxMissingFrames           - Frames before an unlocked track is dropped
+   * @param {number}   opts.stabilityFrames            - Consecutive stable frames needed to lock
+   * @param {number}   opts.stabilityPositionThreshold - Max center movement (px) to count as stable
+   * @param {number}   opts.stabilitySizeThreshold     - Max size change (px) to count as stable
+   * @param {function} opts.onFractalTrigger           - Called with { id, x, y, palette }
    */
   constructor({
     matchDistance = 80,
-    smoothingFactor = 0.15,
-    heightThreshold = 100,
     maxMissingFrames = 15,
-    colorThreshold = 60,
     stabilityFrames = 20,
     stabilityPositionThreshold = 8,
     stabilitySizeThreshold = 8,
-    crushBrightnessGain = 30,
     onFractalTrigger = () => {},
-    onCrushed = () => {},
   } = {}) {
     this.matchDistance = matchDistance;
-    this.smoothingFactor = smoothingFactor;
-    this.heightThreshold = heightThreshold;
     this.maxMissingFrames = maxMissingFrames;
-    this.colorThreshold = colorThreshold;
-
     this.stabilityFrames = stabilityFrames;
     this.stabilityPositionThreshold = stabilityPositionThreshold;
     this.stabilitySizeThreshold = stabilitySizeThreshold;
-
-    this.crushBrightnessGain = crushBrightnessGain;
-
     this.onFractalTrigger = onFractalTrigger;
-    this.onCrushed = onCrushed;
 
     this.tracks = [];
     this.nextTrackId = 0;
+    this.locked = false; // true once any track locks — pauses all detection
   }
 
-  _colorDist(a, b) {
-    if (!a || !b) return 0;
-    return Math.sqrt((a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2);
-  }
+  // ── Private ────────────────────────────────────────────────────────────────
 
   _sampleDominantColors(p, x, y, w, h, count = 3) {
-  const pw = p.width;
-  const ph = p.height;
-  const d = p.pixels;
-  const density = p.pixelDensity();
-  // ignore the outer border so the drawn bbox stroke isn't sampled
-  const inset = 5;
-
-  const x0 = Math.max(0, Math.floor(x + inset));
-  const y0 = Math.max(0, Math.floor(y + inset));
-  const x1 = Math.min(pw, Math.floor(x + w - inset));
-  const y1 = Math.min(ph, Math.floor(y + h - inset));
-
-  
-  // quantized color buckets
-  const buckets = new Map();
-
-  // step a bit for performance
-  const step = 2;
-  const quant = 24; // lower = more grouping
-
-  for (let py = y0; py < y1; py += step) {
-    for (let px = x0; px < x1; px += step) {
-      const i = 4 * ((py * density) * (pw * density) + (px * density));
-      const r = d[i];
-      const g = d[i + 1];
-      const b = d[i + 2];
-
-      const max = Math.max(r, g, b);
-      const min = Math.min(r, g, b);
-      const sat = max - min;
-      const brightness = (r + g + b) / 3;
-
-      // ignore near-black, near-white, and near-gray pixels
-      if (brightness < 25 || brightness > 245 || sat < 18) continue;
-
-      const qr = Math.round(r / quant) * quant;
-      const qg = Math.round(g / quant) * quant;
-      const qb = Math.round(b / quant) * quant;
-
-      const key = `${qr},${qg},${qb}`;
-      const weight = sat + 1; // saturated colors count more
-
-      if (!buckets.has(key)) {
-        buckets.set(key, {
-          rSum: 0,
-          gSum: 0,
-          bSum: 0,
-          weightSum: 0,
-          count: 0,
-        });
-      }
-
-      const bucket = buckets.get(key);
-      bucket.rSum += r * weight;
-      bucket.gSum += g * weight;
-      bucket.bSum += b * weight;
-      bucket.weightSum += weight;
-      bucket.count += 1;
-    }
-  }
-
-  if (buckets.size === 0) {
-    return [
-      { r: 200, g: 200, b: 200 },
-      { r: 160, g: 160, b: 160 },
-      { r: 120, g: 120, b: 120 },
-    ];
-  }
-
-  let colors = Array.from(buckets.values())
-    .map((bucket) => ({
-      r: Math.round(bucket.rSum / bucket.weightSum),
-      g: Math.round(bucket.gSum / bucket.weightSum),
-      b: Math.round(bucket.bSum / bucket.weightSum),
-      score: bucket.count * 0.7 + bucket.weightSum * 0.3,
-    }))
-    .sort((a, b) => b.score - a.score);
-
-  // merge near-duplicate colors
-  const merged = [];
-  const minDist = 35;
-
-  for (const color of colors) {
-    const tooClose = merged.some((c) => this._colorDist(c, color) < minDist);
-    if (!tooClose) merged.push(color);
-    if (merged.length >= count) break;
-  }
-
-  while (merged.length < count) {
-    merged.push(merged[merged.length - 1] || { r: 200, g: 200, b: 200 });
-  }
-
-  return merged.map(({ r, g, b }) => ({ r, g, b }));
-}
-
-  /**
-   * Returns the average perceived brightness (0–255) of all pixels in the box,
-   * using the fast luminance approximation (0.299R + 0.587G + 0.114B).
-   * Background-colour-agnostic: we only ever compare this value against the
-   * baseline captured at lock time, so the absolute level doesn't matter.
-   * @param {object} p  - p5 instance (pixels must already be loaded)
-   * @param {number} x
-   * @param {number} y
-   * @param {number} w
-   * @param {number} h
-   * @returns {number} average brightness in [0, 255]
-   */
-  _sampleAvgBrightness(p, x, y, w, h) {
-    const pw = p.width;
-    const ph = p.height;
+    const pw = p.width, ph = p.height;
     const d = p.pixels;
     const density = p.pixelDensity();
+    const inset = 5; // skip the bbox border pixels
 
-    const x0 = Math.max(0, Math.floor(x));
-    const y0 = Math.max(0, Math.floor(y));
-    const x1 = Math.min(pw, Math.floor(x + w));
-    const y1 = Math.min(ph, Math.floor(y + h));
+    const x0 = Math.max(0,  Math.floor(x + inset));
+    const y0 = Math.max(0,  Math.floor(y + inset));
+    const x1 = Math.min(pw, Math.floor(x + w - inset));
+    const y1 = Math.min(ph, Math.floor(y + h - inset));
 
-    let sum = 0;
-    let total = 0;
+    const buckets = new Map();
+    const step = 2, quant = 24;
 
-    for (let py = y0; py < y1; py++) {
-      for (let px = x0; px < x1; px++) {
+    for (let py = y0; py < y1; py += step) {
+      for (let px = x0; px < x1; px += step) {
         const i = 4 * ((py * density) * (pw * density) + (px * density));
-        sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-        total++;
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+
+        const sat = Math.max(r, g, b) - Math.min(r, g, b);
+        const brightness = (r + g + b) / 3;
+        if (brightness < 25 || brightness > 245 || sat < 18) continue;
+
+        const key = `${Math.round(r/quant)*quant},${Math.round(g/quant)*quant},${Math.round(b/quant)*quant}`;
+        const weight = sat + 1;
+
+        if (!buckets.has(key)) buckets.set(key, { rSum: 0, gSum: 0, bSum: 0, weightSum: 0, count: 0 });
+        const bucket = buckets.get(key);
+        bucket.rSum += r * weight;
+        bucket.gSum += g * weight;
+        bucket.bSum += b * weight;
+        bucket.weightSum += weight;
+        bucket.count += 1;
       }
     }
 
-    return total === 0 ? 255 : sum / total;
-  }
-
-  _isInsideZone(det, zone) {
-    const cx = det.x + det.width / 2;
-    const cy = det.y + det.height / 2;
-
-    return (
-      cx >= zone.x &&
-      cx <= zone.x + zone.width &&
-      cy >= zone.y &&
-      cy <= zone.y + zone.height
-    );
-  }
-
-  _isDetectionInLockedZone(det) {
-    for (const track of this.tracks) {
-      if (!track.locked) continue;
-      const zone = track.lockedBox;
-      if (zone && this._isInsideZone(det, zone)) return true;
+    if (buckets.size === 0) {
+      return [{ r: 200, g: 200, b: 200 }, { r: 160, g: 160, b: 160 }, { r: 120, g: 120, b: 120 }];
     }
-    return false;
+
+    const colors = Array.from(buckets.values())
+      .map((b) => ({
+        r: Math.round(b.rSum / b.weightSum),
+        g: Math.round(b.gSum / b.weightSum),
+        b: Math.round(b.bSum / b.weightSum),
+        score: b.count * 0.7 + b.weightSum * 0.3,
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    const merged = [];
+    for (const color of colors) {
+      const tooClose = merged.some((c) => {
+        const dr = c.r - color.r, dg = c.g - color.g, db = c.b - color.b;
+        return Math.sqrt(dr*dr + dg*dg + db*db) < 35;
+      });
+      if (!tooClose) merged.push(color);
+      if (merged.length >= count) break;
+    }
+
+    while (merged.length < count) merged.push(merged.at(-1) ?? { r: 200, g: 200, b: 200 });
+
+    return merged.map(({ r, g, b }) => ({ r, g, b }));
   }
 
   _updateStability(track, detCX, detCY, det) {
-    const moveDist = Math.hypot(detCX - track.prevCX, detCY - track.prevCY);
-    const widthDiff = Math.abs(det.width - track.prevWidth);
-    const heightDiff = Math.abs(det.height - track.prevHeight);
+    const positionStable = Math.hypot(detCX - track.prevCX, detCY - track.prevCY) <= this.stabilityPositionThreshold;
+    const sizeStable     = Math.abs(det.width  - track.prevWidth)  <= this.stabilitySizeThreshold &&
+                           Math.abs(det.height - track.prevHeight) <= this.stabilitySizeThreshold;
 
-    const positionStable = moveDist <= this.stabilityPositionThreshold;
-    const sizeStable =
-      widthDiff <= this.stabilitySizeThreshold &&
-      heightDiff <= this.stabilitySizeThreshold;
+    track.stableFrames = (positionStable && sizeStable) ? track.stableFrames + 1 : 0;
+    track.prevCX = detCX; track.prevCY = detCY;
+    track.prevWidth = det.width; track.prevHeight = det.height;
 
-    if (positionStable && sizeStable) {
-      track.stableFrames++;
-    } else {
-      track.stableFrames = 0;
-    }
-
-    track.prevCX = detCX;
-    track.prevCY = detCY;
-    track.prevWidth = det.width;
-    track.prevHeight = det.height;
-
-    if (!track.locked && track.stableFrames >= this.stabilityFrames) {
-      track.locked = true;
-      track.lockedBox = {
-        x: track.x,
-        y: track.y,
-        width: track.width,
-        height: track.height,
-      };
-      // baseline is set on the first update() frame after lock
-      track.baselineBrightness = null;
-      track.currentBrightness = null;
-      track.crushTriggered = false;
+    if (track.stableFrames >= this.stabilityFrames) {
+      track.locked    = true;
+      track.lockedBox = { x: track.x, y: track.y, width: track.width, height: track.height };
+      this.locked     = true; // freeze the whole tracker
+      console.log(`Object Locked`);
     }
   }
 
+  // ── Draw helpers ───────────────────────────────────────────────────────────
+
+  _drawLockedTrack(p, track) {
+    const { x, y, width, height } = track.lockedBox;
+    p.stroke(255, 0, 0);
+    p.strokeWeight(2);
+    p.noFill();
+    p.rect(x, y, width, height);
+
+    p.noStroke();
+    p.fill(255, 0, 0);
+    p.textSize(14);
+    p.text(`LOCKED  ID:${track.id}  ${track.label}`, x + 8, y + 18);
+
+    if (track.triggered) {
+      p.fill(255, 140, 0);
+      p.text('TRIGGERED', x + 8, y + 36);
+    }
+  }
+
+  _drawActiveTrack(p, track) {
+    p.stroke(0, 255, 0);
+    p.strokeWeight(2);
+    p.noFill();
+    p.rect(track.x, track.y, track.width, track.height);
+
+    p.noStroke();
+    p.fill(255);
+    p.textSize(14);
+    p.text(`ID:${track.id}  ${track.label}`, track.x + 8, track.y + 18);
+    p.text(`stable: ${track.stableFrames}/${this.stabilityFrames}`, track.x + 8, track.y + 36);
+
+    if (track.palette?.length) {
+      track.palette.forEach((c, i) => {
+        p.fill(c.r, c.g, c.b);
+        p.noStroke();
+        p.rect(track.x + 8 + i * 22, track.y + 46, 18, 12);
+      });
+    }
+  }
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
   /**
-   * Returns all frozen no-detection zones.
-   * Useful for further analysis.
+   * Fire onFractalTrigger for the next locked, untriggered track.
+   * Pass a specific id to target one, or omit to use the first available.
+   * @param {number} [id]
    */
-  getLockedZones() {
-    return this.tracks
-      .filter((t) => t.locked && t.lockedBox)
-      .map((t) => ({
-        id: t.id,
-        label: t.label,
-        x: t.lockedBox.x,
-        y: t.lockedBox.y,
-        width: t.lockedBox.width,
-        height: t.lockedBox.height,
-        cx: t.lockedBox.x + t.lockedBox.width / 2,
-        cy: t.lockedBox.y + t.lockedBox.height / 2,
-      }));
+  triggerOnLocked(id) {
+    const track = id !== undefined
+      ? this.tracks.find((t) => t.locked && !t.triggered && t.id === id)
+      : this.tracks.find((t) => t.locked && !t.triggered);
+
+    if (!track) return;
+
+    track.triggered = true;
+    this.onFractalTrigger({
+      id:      track.id,
+      x:       track.lockedBox.x + track.lockedBox.width  / 2,
+      y:       track.lockedBox.y + track.lockedBox.height / 2,
+      palette: track.palette ?? null,
+    });
+    console.log(`Sent Trigger for tree`);
   }
 
   /**
-   * Optional helper if you want just one zone by id
-   */
-  getLockedZoneById(id) {
-    const track = this.tracks.find((t) => t.id === id && t.locked && t.lockedBox);
-    if (!track) return null;
-
-    return {
-      id: track.id,
-      label: track.label,
-      x: track.lockedBox.x,
-      y: track.lockedBox.y,
-      width: track.lockedBox.width,
-      height: track.lockedBox.height,
-      cx: track.lockedBox.x + track.lockedBox.width / 2,
-      cy: track.lockedBox.y + track.lockedBox.height / 2,
-    };
-  }
-
-  /**
-   * Update tracks with the latest batch of detections.
-   * Call p.loadPixels() before this if you want color sampling.
-   * @param {Array}  detections - ml5 detection results (persons already filtered out)
-   * @param {object} [p]        - p5 instance, required for color sampling
+   * Update tracks from the latest ml5 detections.
+   * Call p.loadPixels() before this for colour sampling.
+   * @param {Array}  detections - ml5 results (persons already filtered out)
+   * @param {object} [p]        - p5 instance
    */
   update(detections, p = null) {
-    // ── Crush detection for locked zones ──────────────────────────────────
-    if (p) {
-      for (const track of this.tracks) {
-        if (!track.locked || !track.lockedBox || track.crushTriggered) continue;
-
-        const { x, y, width, height } = track.lockedBox;
-        const brightness = this._sampleAvgBrightness(p, x, y, width, height);
-
-        // First frame after lock: record baseline
-        if (track.baselineBrightness === null) {
-          track.baselineBrightness = brightness;
-          continue;
-        }
-
-        track.currentBrightness = brightness;
-
-        const gain = brightness - track.baselineBrightness;
-        if (gain >= this.crushBrightnessGain) {
-          track.crushTriggered = true;
-          this.onCrushed({
-            id: track.id,
-            label: track.label,
-            lockedBox: { ...track.lockedBox },
-            baselineBrightness: track.baselineBrightness,
-            currentBrightness: brightness,
-          });
-          this.onFractalTrigger({
-            id: track.id,
-            x: track.lockedBox.x + track.lockedBox.width / 2,
-            y: track.lockedBox.y + track.lockedBox.height / 2,
-            avgColor: track.avgColor ?? null,
-palette: track.palette ?? null,
-          });
-        }
-      }
-    }
-    // ──────────────────────────────────────────────────────────────────────
-    for (const track of this.tracks) {
-      track.matched = false;
-      track.missingFrames++;
-    }
+    if (this.locked) return; // frozen until reset() is called
+    for (const track of this.tracks) track.missingFrames++;
 
     for (const det of detections) {
-      // Ignore new detections inside already locked zones
-      if (this._isDetectionInLockedZone(det)) continue;
-
-      const detCX = det.x + det.width / 2;
+      const detCX = det.x + det.width  / 2;
       const detCY = det.y + det.height / 2;
 
-      const detPalette = p
-  ? this._sampleDominantColors(p, det.x, det.y, det.width, det.height, 3)
-  : null;
-
-const detColor = detPalette ? detPalette[0] : null; // keep first color for matching
-
+      // Find the closest unlocked track of the same label within matchDistance
       let bestTrack = null;
-      let bestDist = Infinity;
+      let bestDist  = this.matchDistance;
 
       for (const track of this.tracks) {
-        if (track.locked) continue; // locked tracks are frozen
-        if (track.label !== det.label) continue;
-
+        if (track.locked || track.label !== det.label) continue;
         const d = Math.hypot(detCX - track.cx, detCY - track.cy);
-        if (d >= bestDist) continue;
-
-        const posMatch = d < this.matchDistance;
-        const colorMatch =
-          this._colorDist(track.avgColor, detColor) < this.colorThreshold;
-
-        if (!posMatch && !colorMatch) continue;
-
-        bestDist = d;
-        bestTrack = track;
+        if (d < bestDist) { bestDist = d; bestTrack = track; }
       }
 
       if (bestTrack) {
-        bestTrack.matched = true;
         bestTrack.missingFrames = 0;
-
-        bestTrack.x = det.x;
-        bestTrack.y = det.y;
-        bestTrack.width = det.width;
-        bestTrack.height = det.height;
-        bestTrack.cx = detCX;
-        bestTrack.cy = detCY;
-
-        // keep palette fresh every frame so it's ready when heightTriggered fires
-        if (detPalette) {
-          bestTrack.palette  = detPalette;
-          bestTrack.avgColor = detPalette[0];
-        }
-
-        bestTrack.smoothedHeight +=
-          (det.height - bestTrack.smoothedHeight) * this.smoothingFactor;
-
-        const diff = Math.abs(bestTrack.smoothedHeight - bestTrack.initialHeight);
-        bestTrack.heightDiff = diff;
+        bestTrack.x = det.x; bestTrack.y = det.y;
+        bestTrack.width = det.width; bestTrack.height = det.height;
+        bestTrack.cx = detCX; bestTrack.cy = detCY;
 
         this._updateStability(bestTrack, detCX, detCY, det);
 
-        if (!bestTrack.heightTriggered && diff > this.heightThreshold) {
-          bestTrack.heightTriggered = true;
-          this.onFractalTrigger({
-            id: bestTrack.id,
-            x: bestTrack.cx,
-            y: bestTrack.cy,
-            palette: bestTrack.palette ?? null,
-          });
-        }
+        // sample palette only while still unlocked — frozen at lock time
+        if (p && !bestTrack.locked) bestTrack.palette = this._sampleDominantColors(p, det.x, det.y, det.width, det.height);
       } else {
         this.tracks.push({
           id: this.nextTrackId++,
           label: det.label,
-          x: det.x,
-          y: det.y,
-          width: det.width,
-          height: det.height,
-          cx: detCX,
-          cy: detCY,
-
-          prevCX: detCX,
-          prevCY: detCY,
-          prevWidth: det.width,
-          prevHeight: det.height,
+          x: det.x, y: det.y, width: det.width, height: det.height,
+          cx: detCX, cy: detCY,
+          prevCX: detCX, prevCY: detCY,
+          prevWidth: det.width, prevHeight: det.height,
           stableFrames: 0,
-          locked: false,
-          lockedBox: null,
-
-          initialHeight: det.height,
-          smoothedHeight: det.height,
-          heightDiff: 0,
-          heightTriggered: false,
+          locked: false, lockedBox: null,
+          triggered: false,
           missingFrames: 0,
-          matched: true,
-          avgColor: detColor,
-palette: detPalette,
+          palette: p ? this._sampleDominantColors(p, det.x, det.y, det.width, det.height) : null,
         });
       }
     }
 
-    this.tracks = this.tracks.filter((t) => {
-      // keep locked tracks permanently, or change this if you want expiry
-      if (t.locked) return true;
-      return t.missingFrames < this.maxMissingFrames;
-    });
+    // locked tracks are kept forever; unlocked ones expire after maxMissingFrames
+    this.tracks = this.tracks.filter((t) => t.locked || t.missingFrames < this.maxMissingFrames);
   }
 
   /**
-   * Draw bounding boxes and debug labels for all active tracks.
-   * Locked tracks are shown in red.
+   * Clear all tracks and unlock the tracker. Call on 'r' keypress.
+   */
+  reset() {
+    this.tracks = [];
+    this.locked = false;
+    console.log(`Tracker Reset`);
+  }
+
+  /**
    * @param {object} p - p5 instance
    */
   draw(p) {
     for (const track of this.tracks) {
-      if (track.locked && track.lockedBox) {
-        //p.stroke(255, 0, 0);
-        p.noStroke();
-        p.strokeWeight(3);
-        p.noFill();
-        p.rect(
-          track.lockedBox.x,
-          track.lockedBox.y,
-          track.lockedBox.width,
-          track.lockedBox.height
-        );
-
-        p.noStroke();
-        p.fill(255, 0, 0);
-        p.textSize(14);
-        p.text(
-          `LOCKED ID: ${track.id} | ${track.label}`,
-          track.lockedBox.x + 8,
-          track.lockedBox.y + 18
-        );
-
-        if (track.baselineBrightness !== null) {
-          const base = track.baselineBrightness.toFixed(1);
-          const cur  = (track.currentBrightness ?? track.baselineBrightness).toFixed(1);
-          p.text(`bright base: ${base}`, track.lockedBox.x + 8, track.lockedBox.y + 36);
-          p.text(`bright now:  ${cur}`,  track.lockedBox.x + 8, track.lockedBox.y + 54);
-          if (track.crushTriggered) {
-            p.fill(255, 140, 0);
-            p.text(`CRUSHED`, track.lockedBox.x + 8, track.lockedBox.y + 72);
-          }
-        }
-        continue;
-      }
-
-      //p.stroke(0, 255, 0);
-      p.noStroke();
-      p.strokeWeight(3);
-      p.noFill();
-      p.rect(track.x, track.y, track.width, track.height);
-
-      p.noStroke();
-      p.fill(255);
-      p.textSize(14);
-      p.text(`ID: ${track.id} | ${track.label}`, track.x + 8, track.y + 18);
-      p.text(`initial h: ${track.initialHeight.toFixed(1)}`, track.x + 8, track.y + 36);
-      p.text(`current h: ${track.smoothedHeight.toFixed(1)}`, track.x + 8, track.y + 54);
-      p.text(`diff: ${track.heightDiff.toFixed(1)}`, track.x + 8, track.y + 72);
-      p.text(`stable: ${track.stableFrames}/${this.stabilityFrames}`, track.x + 8, track.y + 90);
-
-      if (track.palette?.length) {
-  p.noStroke();
-
-  track.palette.forEach((c, idx) => {
-    p.fill(c.r, c.g, c.b);
-    p.rect(track.x + 8 + idx * 22, track.y + 100, 18, 12);
-  });
-
-  const c = track.palette[0];
-  p.fill(255);
-  p.text(`rgb(${c.r},${c.g},${c.b})`, track.x + 80, track.y + 111);
-}
+      if (track.locked) this._drawLockedTrack(p, track);
+      else              this._drawActiveTrack(p, track);
     }
   }
 }
